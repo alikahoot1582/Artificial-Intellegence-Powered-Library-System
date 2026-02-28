@@ -10,7 +10,8 @@ import json
 import sqlite3
 import os
 from datetime import datetime
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -296,36 +297,48 @@ def sync_library():
 def get_client():
     api_key = st.session_state.get("anthropic_api_key", "").strip()
     if api_key:
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            tools=_build_gemini_tools(),
-        )
+        return genai.Client(api_key=api_key)
     return None
 
 
 def _build_gemini_tools():
-    """Convert our tool definitions into Gemini FunctionDeclaration format."""
-    from google.generativeai.types import content_types
+    """Convert tool definitions into new google-genai SDK FunctionDeclaration format."""
+    TYPE_MAP = {
+        "string": genai_types.Type.STRING,
+        "integer": genai_types.Type.INTEGER,
+        "number": genai_types.Type.NUMBER,
+        "boolean": genai_types.Type.BOOLEAN,
+        "array": genai_types.Type.ARRAY,
+        "object": genai_types.Type.OBJECT,
+    }
+
+    def build_schema(pval):
+        ptype = TYPE_MAP.get(str(pval.get("type", "string")).lower(), genai_types.Type.STRING)
+        kwargs = {"type": ptype}
+        if "description" in pval:
+            kwargs["description"] = pval["description"]
+        if "enum" in pval:
+            kwargs["enum"] = [str(e) for e in pval["enum"] if e]
+        return genai_types.Schema(**kwargs)
+
     declarations = []
     for t in TOOLS:
-        schema = t["input_schema"].copy()
-        # Gemini does not accept 'default' inside properties
+        schema = t["input_schema"]
         props = {}
         for pname, pval in schema.get("properties", {}).items():
-            clean = {k: v for k, v in pval.items() if k not in ("default",)}
-            # Gemini only supports a subset of JSON Schema types; map accordingly
-            if "enum" in clean and "type" not in clean:
-                clean["type"] = "string"
-            props[pname] = clean
-        clean_schema = {k: v for k, v in schema.items() if k != "properties"}
-        clean_schema["properties"] = props
-        declarations.append(genai.protos.FunctionDeclaration(
+            props[pname] = build_schema(pval)
+        required = schema.get("required", [])
+        param_schema = genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties=props,
+            required=required,
+        )
+        declarations.append(genai_types.FunctionDeclaration(
             name=t["name"],
             description=t["description"],
-            parameters=clean_schema,
+            parameters=param_schema,
         ))
-    return [genai.protos.Tool(function_declarations=declarations)]
+    return [genai_types.Tool(function_declarations=declarations)]
 
 # ─── Session State ───────────────────────────────────────────────────────────
 def init_state():
@@ -626,33 +639,43 @@ Guidelines:
 - Be warm, literary, and enthusiastic. Recommend related books proactively.
 """
 
-    # Build Gemini chat history from session messages (excluding last user msg)
+    # Build message history for the new SDK format
     history = []
     for m in st.session_state.messages:
         role = "user" if m["role"] == "user" else "model"
-        history.append({"role": role, "parts": [m["content"]]})
+        history.append(genai_types.Content(role=role, parts=[genai_types.Part(text=m["content"])]))
 
     st.session_state.messages.append({"role": "user", "content": user_message})
 
-    try:
-        chat = client.start_chat(history=history)
+    gemini_tools = _build_gemini_tools()
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        tools=gemini_tools,
+    )
 
-        # Agentic loop
-        response = chat.send_message(user_message)
+    try:
+        # Start with full history + new user message
+        contents = history + [genai_types.Content(role="user", parts=[genai_types.Part(text=user_message)])]
 
         while True:
-            # Collect all function calls from this response
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=contents,
+                config=config,
+            )
+
+            candidate = response.candidates[0]
             fn_calls = []
             text_parts = []
-            for part in response.parts:
-                if part.function_call.name:
+
+            for part in candidate.content.parts:
+                if part.function_call:
                     fn_calls.append(part.function_call)
                 elif part.text:
                     text_parts.append(part.text)
 
             if text_parts:
-                final_text = "\n".join(text_parts)
-                yield ("text", final_text)
+                yield ("text", "\n".join(text_parts))
 
             # No tool calls — done
             if not fn_calls:
@@ -660,33 +683,36 @@ Guidelines:
                     st.session_state.messages.append({"role": "assistant", "content": "\n".join(text_parts)})
                 break
 
-            # Execute tool calls and collect results
-            tool_response_parts = []
+            # Append model response to contents
+            contents.append(candidate.content)
+
+            # Execute tools and build function response parts
+            fn_response_parts = []
             for fc in fn_calls:
                 fn_name = fc.name
-                fn_args = dict(fc.args)
+                fn_args = dict(fc.args) if fc.args else {}
                 yield ("tool_call", f"🔧 {fn_name}({str(fn_args)[:80]}...)")
                 fn = TOOL_MAP.get(fn_name)
                 result = fn(**fn_args) if fn else {"error": f"Unknown tool: {fn_name}"}
                 yield ("tool_result", f"✅ {fn_name} → {len(str(result))} chars")
-                tool_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
+                fn_response_parts.append(
+                    genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
                             name=fn_name,
-                            response={"result": result},
+                            response={"result": json.dumps(result)},
                         )
                     )
                 )
 
-            # Send all tool results back in one turn
-            response = chat.send_message(tool_response_parts)
+            # Append tool results as a user turn
+            contents.append(genai_types.Content(role="user", parts=fn_response_parts))
 
     except Exception as e:
         err_str = str(e)
         # Roll back the user message on failure
         if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
             st.session_state.messages.pop()
-        if "API_KEY_INVALID" in err_str or "invalid" in err_str.lower() and "key" in err_str.lower():
+        if "API_KEY_INVALID" in err_str or ("invalid" in err_str.lower() and "key" in err_str.lower()):
             yield ("error", "🔑 **Invalid API key.** Check the key in the sidebar. Get yours at https://aistudio.google.com/apikey")
         elif "PERMISSION_DENIED" in err_str or "403" in err_str:
             yield ("error", "🚫 **Permission denied.** Your key may not have access to this model.")
