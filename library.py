@@ -1,6 +1,6 @@
 """
 📚 AI-Powered Library — Streamlit Agentic App
-Uses Claude AI + Open Library API + Project Gutenberg to search, retrieve, and manage books.
+Uses Google Gemini + Open Library API + Project Gutenberg to search, retrieve, and manage books.
 Features: SQLite persistence, reading progress, ratings, full book content from Gutenberg.
 """
 
@@ -10,7 +10,7 @@ import json
 import sqlite3
 import os
 from datetime import datetime
-from anthropic import Anthropic
+import google.generativeai as genai
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -292,12 +292,40 @@ def sync_library():
     st.session_state.personal_library = db_load_library()
 
 # ─── Anthropic Client ────────────────────────────────────────────────────────
-@st.cache_resource
+# NOTE: Do NOT cache — key changes at runtime.
 def get_client():
-    api_key = st.session_state.get("anthropic_api_key", "")
+    api_key = st.session_state.get("anthropic_api_key", "").strip()
     if api_key:
-        return Anthropic(api_key=api_key)
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            tools=_build_gemini_tools(),
+        )
     return None
+
+
+def _build_gemini_tools():
+    """Convert our tool definitions into Gemini FunctionDeclaration format."""
+    from google.generativeai.types import content_types
+    declarations = []
+    for t in TOOLS:
+        schema = t["input_schema"].copy()
+        # Gemini does not accept 'default' inside properties
+        props = {}
+        for pname, pval in schema.get("properties", {}).items():
+            clean = {k: v for k, v in pval.items() if k not in ("default",)}
+            # Gemini only supports a subset of JSON Schema types; map accordingly
+            if "enum" in clean and "type" not in clean:
+                clean["type"] = "string"
+            props[pname] = clean
+        clean_schema = {k: v for k, v in schema.items() if k != "properties"}
+        clean_schema["properties"] = props
+        declarations.append(genai.protos.FunctionDeclaration(
+            name=t["name"],
+            description=t["description"],
+            parameters=clean_schema,
+        ))
+    return [genai.protos.Tool(function_declarations=declarations)]
 
 # ─── Session State ───────────────────────────────────────────────────────────
 def init_state():
@@ -579,17 +607,14 @@ TOOL_MAP = {
 def run_agent(user_message: str):
     client = get_client()
     if not client:
-        yield ("error", "⚠️ Please enter your Anthropic API key in the sidebar.")
+        yield ("error", "⚠️ Please enter your Gemini API key in the sidebar.")
         return
-
-    st.session_state.messages.append({"role": "user", "content": user_message})
-    api_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
 
     system_prompt = """You are a knowledgeable and passionate library assistant AI. You help users discover, manage, and READ books.
 
 You have access to:
 1. Open Library API — search millions of real books from the internet
-2. Project Gutenberg — search and fetch full text of thousands of FREE classic books  
+2. Project Gutenberg — search and fetch full text of thousands of FREE classic books
 3. Personal Library — the user's own collection with persistent reading progress and ratings
 
 Guidelines:
@@ -601,41 +626,76 @@ Guidelines:
 - Be warm, literary, and enthusiastic. Recommend related books proactively.
 """
 
-    while True:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            system=system_prompt,
-            tools=TOOLS,
-            messages=api_messages,
-        )
+    # Build Gemini chat history from session messages (excluding last user msg)
+    history = []
+    for m in st.session_state.messages:
+        role = "user" if m["role"] == "user" else "model"
+        history.append({"role": role, "parts": [m["content"]]})
 
-        text_parts, tool_uses = [], []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_uses.append(block)
+    st.session_state.messages.append({"role": "user", "content": user_message})
 
-        if text_parts:
-            yield ("text", "\n".join(text_parts))
+    try:
+        chat = client.start_chat(history=history)
 
-        if response.stop_reason == "end_turn" or not tool_uses:
-            final = "\n".join(text_parts)
-            if final:
-                st.session_state.messages.append({"role": "assistant", "content": final})
-            break
+        # Agentic loop
+        response = chat.send_message(user_message)
 
-        tool_results = []
-        for tu in tool_uses:
-            yield ("tool_call", f"🔧 {tu.name}({json.dumps(tu.input)[:80]}...)")
-            fn = TOOL_MAP.get(tu.name)
-            result = fn(**tu.input) if fn else {"error": f"Unknown tool: {tu.name}"}
-            yield ("tool_result", f"✅ {tu.name} → {len(str(result))} chars")
-            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(result)})
+        while True:
+            # Collect all function calls from this response
+            fn_calls = []
+            text_parts = []
+            for part in response.parts:
+                if part.function_call.name:
+                    fn_calls.append(part.function_call)
+                elif part.text:
+                    text_parts.append(part.text)
 
-        api_messages.append({"role": "assistant", "content": response.content})
-        api_messages.append({"role": "user", "content": tool_results})
+            if text_parts:
+                final_text = "\n".join(text_parts)
+                yield ("text", final_text)
+
+            # No tool calls — done
+            if not fn_calls:
+                if text_parts:
+                    st.session_state.messages.append({"role": "assistant", "content": "\n".join(text_parts)})
+                break
+
+            # Execute tool calls and collect results
+            tool_response_parts = []
+            for fc in fn_calls:
+                fn_name = fc.name
+                fn_args = dict(fc.args)
+                yield ("tool_call", f"🔧 {fn_name}({str(fn_args)[:80]}...)")
+                fn = TOOL_MAP.get(fn_name)
+                result = fn(**fn_args) if fn else {"error": f"Unknown tool: {fn_name}"}
+                yield ("tool_result", f"✅ {fn_name} → {len(str(result))} chars")
+                tool_response_parts.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=fn_name,
+                            response={"result": result},
+                        )
+                    )
+                )
+
+            # Send all tool results back in one turn
+            response = chat.send_message(tool_response_parts)
+
+    except Exception as e:
+        err_str = str(e)
+        # Roll back the user message on failure
+        if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+            st.session_state.messages.pop()
+        if "API_KEY_INVALID" in err_str or "invalid" in err_str.lower() and "key" in err_str.lower():
+            yield ("error", "🔑 **Invalid API key.** Check the key in the sidebar. Get yours at https://aistudio.google.com/apikey")
+        elif "PERMISSION_DENIED" in err_str or "403" in err_str:
+            yield ("error", "🚫 **Permission denied.** Your key may not have access to this model.")
+        elif "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+            yield ("error", "⏳ **Rate limit reached.** Please wait a moment and try again.")
+        elif "Connection" in err_str or "network" in err_str.lower():
+            yield ("error", "🌐 **Network error.** Check your internet connection and try again.")
+        else:
+            yield ("error", f"❌ **API error:** {err_str[:300]}")
 
 
 # ─── UI Helpers ──────────────────────────────────────────────────────────────
@@ -661,11 +721,18 @@ with st.sidebar:
     st.markdown("## 📚 The Library")
     st.markdown("---")
 
-    api_key = st.text_input("Anthropic API Key", type="password",
-                             value=st.session_state.anthropic_api_key, placeholder="sk-ant-...")
+    api_key = st.text_input("Gemini API Key", type="password",
+                             value=st.session_state.anthropic_api_key, placeholder="AIza...")
     if api_key != st.session_state.anthropic_api_key:
-        st.session_state.anthropic_api_key = api_key
-        st.cache_resource.clear()
+        st.session_state.anthropic_api_key = api_key.strip()
+
+    if st.session_state.anthropic_api_key:
+        if len(st.session_state.anthropic_api_key) > 20:
+            st.markdown("<div style=\'color:#7fc97f;font-size:0.85rem\'>✅ API key set</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div style=\'color:#e07070;font-size:0.85rem\'>⚠️ Key looks too short — check it</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style=\'color:#e0b870;font-size:0.85rem\'>🔑 Enter key to use AI Chat</div>", unsafe_allow_html=True)
 
     st.markdown("---")
     page = st.radio("Navigate", ["💬 Chat", "📖 My Library", "🔍 Quick Search", "📑 Read a Book", "📊 Stats"], key="nav")
